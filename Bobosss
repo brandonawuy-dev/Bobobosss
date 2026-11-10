@@ -1,0 +1,820 @@
+
+--==================================================
+-- MULTI-BOSS CONTINUOUS SERVER HUNTER
+-- Rayfield | Delta Executor
+--==================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+--==================================================
+-- RAYFIELD
+--==================================================
+
+local Rayfield = loadstring(game:HttpGet(
+    "https://sirius.menu/rayfield"
+))()
+
+--==================================================
+-- CONFIGURATION
+--==================================================
+
+local ConfigFolder = "MultiBossHunter"
+local ConfigFile = ConfigFolder .. "/Settings.json"
+
+local Config = {
+    SelectedBoss = "Gorilla King",
+
+    MasterEnabled = true,
+    AutoServerHop = true,
+    AutoTargetEnabled = true,
+    AutoFireEnabled = true,
+    LockPosition = false,
+
+    AutoFireInterval = 0.21,
+    EmptyServerDelay = 2,
+    HopTimeout = 60
+}
+
+--==================================================
+-- BOSS MAPPING
+--==================================================
+
+local BossMapping = {
+    ["Gorilla King"] = {
+        Zone = "Boss02"
+    },
+
+    ["Whitefang Sabertooth"] = {
+        Zone = "Boss03"
+    },
+
+    ["Tempest Dragon King"] = {
+        Zone = "Boss04"
+    },
+
+    ["Volcano Turtle King"] = {
+        Zone = "Boss05"
+    }
+}
+
+local BossOptions = {
+    "Gorilla King",
+    "Whitefang Sabertooth",
+    "Tempest Dragon King",
+    "Volcano Turtle King"
+}
+
+--==================================================
+-- REMOTES
+--==================================================
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+
+local SetTarget = Remotes:WaitForChild("SetTarget")
+local BotAutoState = Remotes:WaitForChild("BotAutoState")
+local UseSkill = Remotes:WaitForChild("UseSkill")
+
+--==================================================
+-- CONFIGURATION SAVE / LOAD
+--==================================================
+
+local function SaveConfig()
+    if not writefile then
+        warn("writefile is unavailable")
+        return
+    end
+
+    pcall(function()
+        if not isfolder(ConfigFolder) then
+            makefolder(ConfigFolder)
+        end
+
+        local Data = {
+            SelectedBoss = Config.SelectedBoss,
+            AutoServerHop = Config.AutoServerHop,
+            AutoTargetEnabled = Config.AutoTargetEnabled,
+            AutoFireEnabled = Config.AutoFireEnabled,
+            AutoFireInterval = Config.AutoFireInterval,
+            LockPosition = Config.LockPosition,
+            EmptyServerDelay = Config.EmptyServerDelay,
+            HopTimeout = Config.HopTimeout
+        }
+
+        writefile(ConfigFile, HttpService:JSONEncode(Data))
+    end)
+end
+
+local function LoadConfig()
+    if not isfile or not readfile then
+        return
+    end
+
+    pcall(function()
+        if not isfile(ConfigFile) then
+            return
+        end
+
+        local Data = HttpService:JSONDecode(readfile(ConfigFile))
+
+        for Key, Value in pairs(Data) do
+            if Config[Key] ~= nil then
+                Config[Key] = Value
+            end
+        end
+    end)
+
+    if not BossMapping[Config.SelectedBoss] then
+        Config.SelectedBoss = "Gorilla King"
+    end
+end
+
+LoadConfig()
+
+--==================================================
+-- STATE
+--==================================================
+
+local CurrentTarget = nil
+local HunterRunning = false
+local IsHopping = false
+
+local HunterGeneration = 0
+local FireGeneration = 0
+
+local CharacterConnection = nil
+
+--==================================================
+-- NOTIFICATION
+--==================================================
+
+local function Notify(Title, Content)
+    pcall(function()
+        Rayfield:Notify({
+            Title = Title,
+            Content = Content,
+            Duration = 4
+        })
+    end)
+end
+
+--==================================================
+-- GET SELECTED ZONE
+--==================================================
+
+local function GetSelectedZone()
+    local Mapping = BossMapping[Config.SelectedBoss]
+    if not Mapping then
+        return nil
+    end
+
+    local Zones = workspace:FindFirstChild("Zones")
+    if not Zones then
+        warn("Workspace.Zones not found")
+        return nil
+    end
+
+    local Zone = Zones:FindFirstChild(Mapping.Zone)
+
+    if not Zone then
+        warn("Boss zone not found: " .. Mapping.Zone)
+        return nil
+    end
+
+    if not Zone:IsA("BasePart") then
+        warn("Boss zone is not a BasePart: " .. Zone.ClassName)
+        return nil
+    end
+
+    return Zone
+end
+
+--==================================================
+-- TELEPORT TO BOSS ZONE
+-- 2 STUDS ABOVE THE PART
+--==================================================
+
+local function TeleportToBossZone()
+    local Character = LocalPlayer.Character
+    if not Character then
+        return false
+    end
+
+    local Root = Character:FindFirstChild("HumanoidRootPart")
+    if not Root then
+        return false
+    end
+
+    local Zone = GetSelectedZone()
+    if not Zone then
+        return false
+    end
+
+    local Destination = Zone.CFrame + Vector3.new(0, 2, 0)
+
+    local Success, Error = pcall(function()
+        Character:PivotTo(Destination)
+    end)
+
+    if not Success then
+        warn("Teleport failed: " .. tostring(Error))
+        return false
+    end
+
+    return true
+end
+
+--==================================================
+-- POSITION LOCK
+-- Restores selected zone after respawn
+--==================================================
+
+local function SetupPositionLock()
+    if CharacterConnection then
+        CharacterConnection:Disconnect()
+        CharacterConnection = nil
+    end
+
+    if not Config.LockPosition then
+        return
+    end
+
+    CharacterConnection = LocalPlayer.CharacterAdded:Connect(function(Character)
+        task.wait(1.5)
+
+        if not Config.LockPosition then
+            return
+        end
+
+        if Character and Character.Parent then
+            TeleportToBossZone()
+        end
+    end)
+end
+
+--==================================================
+-- BOSS DETECTION
+--==================================================
+
+local function GetBossTargets()
+    local Monsters = workspace:FindFirstChild("Monsters")
+    if not Monsters then
+        return {}
+    end
+
+    local Results = {}
+
+    for _, Object in ipairs(Monsters:GetDescendants()) do
+        if Object:IsA("Model")
+            and Object.Name == Config.SelectedBoss
+            and Object.Parent then
+
+            table.insert(Results, Object)
+        end
+    end
+
+    return Results
+end
+
+local function GetNearestBoss()
+    local Targets = GetBossTargets()
+
+    if #Targets == 0 then
+        return nil
+    end
+
+    local Character = LocalPlayer.Character
+    local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+
+    if not Root then
+        return Targets[1]
+    end
+
+    local Nearest = nil
+    local NearestDistance = math.huge
+
+    for _, Boss in ipairs(Targets) do
+        local BossRoot = Boss:FindFirstChild("HumanoidRootPart")
+            or Boss.PrimaryPart
+            or Boss:FindFirstChildWhichIsA("BasePart", true)
+
+        if BossRoot then
+            local Distance = (Root.Position - BossRoot.Position).Magnitude
+
+            if Distance < NearestDistance then
+                NearestDistance = Distance
+                Nearest = Boss
+            end
+        end
+    end
+
+    return Nearest or Targets[1]
+end
+
+--==================================================
+-- SET BOSS TARGET
+--==================================================
+
+local function SetBossTarget(Boss)
+    if not Boss or not Boss.Parent then
+        return false
+    end
+
+    local Success, Error = pcall(function()
+        SetTarget:FireServer(Boss, false)
+    end)
+
+    if not Success then
+        warn("SetTarget error: " .. tostring(Error))
+        return false
+    end
+
+    CurrentTarget = Boss
+    return true
+end
+
+--==================================================
+-- AUTO FIRE
+--==================================================
+
+local function StopAutoFire()
+    FireGeneration += 1
+end
+
+local function StartAutoFire()
+    StopAutoFire()
+
+    if not Config.AutoFireEnabled then
+        return
+    end
+
+    FireGeneration += 1
+    local MyGeneration = FireGeneration
+
+    task.spawn(function()
+        while Config.MasterEnabled
+            and Config.AutoFireEnabled
+            and FireGeneration == MyGeneration do
+
+            local Boss = CurrentTarget
+
+            if Boss and Boss.Parent then
+                pcall(function()
+                    UseSkill:FireServer("iaigiri", Boss)
+                end)
+            end
+
+            task.wait(math.max(Config.AutoFireInterval, 0.21))
+        end
+    end)
+end
+
+--==================================================
+-- APPROACH BOSS
+--==================================================
+
+local function ApproachBoss(Boss)
+    if not Boss or not Boss.Parent then
+        return
+    end
+
+    local Character = LocalPlayer.Character
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+
+    local BossRoot = Boss:FindFirstChild("HumanoidRootPart")
+        or Boss.PrimaryPart
+        or Boss:FindFirstChildWhichIsA("BasePart", true)
+
+    if Humanoid and BossRoot then
+        pcall(function()
+            Humanoid:MoveTo(BossRoot.Position)
+        end)
+    end
+end
+
+--==================================================
+-- SERVER HOP
+--==================================================
+
+local function ServerHop()
+    if IsHopping or not Config.AutoServerHop then
+        return false
+    end
+
+    IsHopping = true
+
+    Notify("Server Hop", "Searching for another server...")
+
+    local StartTime = os.clock()
+    local Cursor = nil
+
+    while os.clock() - StartTime < Config.HopTimeout do
+        local URL = "https://games.roblox.com/v1/games/"
+            .. tostring(game.PlaceId)
+            .. "/servers/Public?sortOrder=Asc&limit=100"
+
+        if Cursor then
+            URL = URL .. "&cursor=" .. HttpService:UrlEncode(Cursor)
+        end
+
+        local Success, Response = pcall(function()
+            return game:HttpGet(URL)
+        end)
+
+        if Success then
+            local DecodeSuccess, Data = pcall(function()
+                return HttpService:JSONDecode(Response)
+            end)
+
+            if DecodeSuccess and Data and Data.data then
+                for _, Server in ipairs(Data.data) do
+                    if Server.id ~= game.JobId
+                        and Server.playing < Server.maxPlayers then
+
+                        local HopSuccess = pcall(function()
+                            TeleportService:TeleportToPlaceInstance(
+                                game.PlaceId,
+                                Server.id,
+                                LocalPlayer
+                            )
+                        end)
+
+                        if HopSuccess then
+                            return true
+                        end
+                    end
+                end
+
+                Cursor = Data.nextPageCursor
+
+                if not Cursor then
+                    break
+                end
+            else
+                warn("Unable to decode server list")
+                break
+            end
+        else
+            warn("Server list request failed: " .. tostring(Response))
+            break
+        end
+
+        task.wait(1)
+    end
+
+    IsHopping = false
+
+    Notify("Server Hop", "No suitable server found. Retrying.")
+    return false
+end
+
+--==================================================
+-- EMPTY SERVER CHECK
+-- Wait 2 seconds, scan again, then hop
+--==================================================
+
+local function EmptyServerCheck()
+    if #GetBossTargets() > 0 then
+        return false
+    end
+
+    Notify(
+        "Boss Not Found",
+        Config.SelectedBoss .. " not detected. Rechecking..."
+    )
+
+    task.wait(Config.EmptyServerDelay)
+
+    if not Config.MasterEnabled then
+        return false
+    end
+
+    if #GetBossTargets() > 0 then
+        return false
+    end
+
+    if Config.AutoServerHop then
+        ServerHop()
+    end
+
+    return true
+end
+
+--==================================================
+-- STOP HUNTER
+--==================================================
+
+local function StopHunter()
+    HunterGeneration += 1
+    HunterRunning = false
+
+    CurrentTarget = nil
+
+    StopAutoFire()
+
+    pcall(function()
+        BotAutoState:FireServer(false)
+    end)
+end
+
+--==================================================
+-- START HUNTER
+--==================================================
+
+local function StartHunter()
+    StopHunter()
+
+    if not Config.MasterEnabled then
+        return
+    end
+
+    HunterGeneration += 1
+
+    local MyGeneration = HunterGeneration
+
+    HunterRunning = true
+
+    pcall(function()
+        BotAutoState:FireServer(true)
+    end)
+
+    TeleportToBossZone()
+    StartAutoFire()
+
+    task.spawn(function()
+        while Config.MasterEnabled
+            and HunterRunning
+            and HunterGeneration == MyGeneration do
+
+            if IsHopping then
+                task.wait(1)
+                continue
+            end
+
+            local Boss = GetNearestBoss()
+
+            if Boss then
+                if Config.AutoTargetEnabled then
+                    if CurrentTarget ~= Boss then
+                        SetBossTarget(Boss)
+                        ApproachBoss(Boss)
+
+                        Notify(
+                            "Boss Detected",
+                            "Target: " .. Config.SelectedBoss
+                        )
+                    end
+                end
+
+                if not Boss.Parent then
+                    CurrentTarget = nil
+                end
+
+                task.wait(0.5)
+            else
+                CurrentTarget = nil
+
+                EmptyServerCheck()
+
+                task.wait(1)
+            end
+        end
+    end)
+end
+
+--==================================================
+-- RESTART HUNTER
+--==================================================
+
+local function RestartHunter()
+    StopHunter()
+
+    if Config.MasterEnabled then
+        task.wait(0.25)
+        StartHunter()
+    end
+end
+
+--==================================================
+-- RAYFIELD WINDOW
+--==================================================
+
+local Window = Rayfield:CreateWindow({
+    Name = "Multi-Boss Hunter",
+    LoadingTitle = "Boss Hunting System",
+    LoadingSubtitle = "Continuous Server Hunter",
+
+    ConfigurationSaving = {
+        Enabled = false
+    },
+
+    KeySystem = false
+})
+
+--==================================================
+-- HUNTER TAB
+--==================================================
+
+local HunterTab = Window:CreateTab("Hunter", 4483362458)
+
+HunterTab:CreateSection("Main Controls")
+
+HunterTab:CreateToggle({
+    Name = "Master Automation",
+    CurrentValue = Config.MasterEnabled,
+
+    Callback = function(Value)
+        Config.MasterEnabled = Value
+
+        if Value then
+            StartHunter()
+        else
+            StopHunter()
+        end
+    end
+})
+
+HunterTab:CreateDropdown({
+    Name = "Select Boss",
+    Options = BossOptions,
+    CurrentOption = {Config.SelectedBoss},
+    MultipleOptions = false,
+
+    Callback = function(Option)
+        local Selected = Option
+
+        if type(Option) == "table" then
+            Selected = Option[1]
+        end
+
+        if not BossMapping[Selected] then
+            return
+        end
+
+        Config.SelectedBoss = Selected
+
+        SaveConfig()
+
+        Notify("Boss Selected", Selected)
+
+        RestartHunter()
+    end
+})
+
+HunterTab:CreateToggle({
+    Name = "Auto Target",
+    CurrentValue = Config.AutoTargetEnabled,
+
+    Callback = function(Value)
+        Config.AutoTargetEnabled = Value
+        SaveConfig()
+
+        if not Value then
+            CurrentTarget = nil
+        end
+    end
+})
+
+HunterTab:CreateToggle({
+    Name = "Auto Fire",
+    CurrentValue = Config.AutoFireEnabled,
+
+    Callback = function(Value)
+        Config.AutoFireEnabled = Value
+        SaveConfig()
+
+        if Value and Config.MasterEnabled then
+            StartAutoFire()
+        else
+            StopAutoFire()
+        end
+    end
+})
+
+HunterTab:CreateSlider({
+    Name = "Auto Fire Interval",
+    Range = {0.21, 2},
+    Increment = 0.01,
+    Suffix = "Seconds",
+    CurrentValue = Config.AutoFireInterval,
+
+    Callback = function(Value)
+        Config.AutoFireInterval = Value
+        SaveConfig()
+
+        if Config.MasterEnabled and Config.AutoFireEnabled then
+            StartAutoFire()
+        end
+    end
+})
+
+HunterTab:CreateSection("Server Controls")
+
+HunterTab:CreateToggle({
+    Name = "Auto Server Hop",
+    CurrentValue = Config.AutoServerHop,
+
+    Callback = function(Value)
+        Config.AutoServerHop = Value
+        SaveConfig()
+    end
+})
+
+HunterTab:CreateSlider({
+    Name = "Empty Server Recheck Delay",
+    Range = {1, 10},
+    Increment = 1,
+    Suffix = "Seconds",
+    CurrentValue = Config.EmptyServerDelay,
+
+    Callback = function(Value)
+        Config.EmptyServerDelay = Value
+        SaveConfig()
+    end
+})
+
+HunterTab:CreateButton({
+    Name = "Save Configuration",
+
+    Callback = function()
+        SaveConfig()
+        Notify("Configuration", "Settings saved.")
+    end
+})
+
+--==================================================
+-- POSITION TAB
+--==================================================
+
+local PositionTab = Window:CreateTab("Position", 4483362458)
+
+PositionTab:CreateSection("Boss Zone Position")
+
+PositionTab:CreateToggle({
+    Name = "Lock Position",
+    CurrentValue = Config.LockPosition,
+
+    Callback = function(Value)
+        Config.LockPosition = Value
+
+        SetupPositionLock()
+        SaveConfig()
+
+        Notify(
+            "Position Lock",
+            Value and "Enabled" or "Disabled"
+        )
+    end
+})
+
+PositionTab:CreateButton({
+    Name = "Teleport To Selected Boss Zone",
+
+    Callback = function()
+        local Success = TeleportToBossZone()
+
+        if Success then
+            Notify(
+                "Teleport",
+                "Teleported 2 studs above " ..
+                BossMapping[Config.SelectedBoss].Zone
+            )
+        else
+            Notify("Teleport Failed", "Could not find the selected boss zone.")
+        end
+    end
+})
+
+PositionTab:CreateButton({
+    Name = "Save Configuration",
+
+    Callback = function()
+        SaveConfig()
+        Notify("Configuration", "Settings saved.")
+    end
+})
+
+--==================================================
+-- INITIALIZE
+--==================================================
+
+SetupPositionLock()
+
+SaveConfig()
+
+if Config.MasterEnabled then
+    StartHunter()
+end
+
+Notify(
+    "Multi-Boss Hunter",
+    "Loaded. Selected boss: " .. Config.SelectedBoss
+)
+
+--==================================================
+-- END
+--==================================================
